@@ -14,9 +14,9 @@
 # ==============================================================================
 """Layer Norm."""
 
-import collections
+import collections.abc
 import types
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Tuple, Union
 
 from haiku._src import base
 from haiku._src import initializers
@@ -33,6 +33,32 @@ hk.initializers = initializers
 hk.Module = module.Module
 del base, module, initializers
 
+AxisOrAxes = Union[int, Sequence[int], slice]
+AxesOrSlice = Union[Tuple[int, ...], slice]
+
+# TODO(tomhennigan): Update users to `channel_axis=-1` and flip + remove this.
+ERROR_FOR_ERROR_PRONE_CHANNELS = False
+
+
+def to_axes_or_slice(axis: AxisOrAxes) -> AxesOrSlice:
+  if isinstance(axis, slice):
+    return axis
+  elif isinstance(axis, int):
+    return (axis,)
+  elif (isinstance(axis, collections.abc.Iterable) and
+        all(isinstance(ax, int) for ax in axis)):
+    return tuple(axis)
+  else:
+    raise ValueError(
+        f"`axis` should be an int, slice or iterable of ints. Got: {axis}")
+
+
+def to_abs_axes(axis: AxesOrSlice, ndim: int) -> Tuple[int, ...]:
+  if isinstance(axis, slice):
+    return tuple(range(ndim)[axis])
+  else:
+    return tuple(sorted({a % ndim for a in axis}))
+
 
 class LayerNorm(hk.Module):
   """LayerNorm module.
@@ -42,7 +68,7 @@ class LayerNorm(hk.Module):
 
   def __init__(
       self,
-      axis: Union[int, Sequence[int], slice],
+      axis: AxisOrAxes,
       create_scale: bool,
       create_offset: bool,
       eps: float = 1e-5,
@@ -50,8 +76,16 @@ class LayerNorm(hk.Module):
       offset_init: Optional[hk.initializers.Initializer] = None,
       use_fast_variance: bool = False,
       name: Optional[str] = None,
+      channel_axis: Optional[AxisOrAxes] = None,
   ):
     """Constructs a LayerNorm module.
+
+    NOTE: We deviate from Sonnet 1/2 by allowing multiple channel/feature axes
+    to be specified (via ``channel_axis``) which are in turn used for the
+    learnable scale/offset shape. This enables users to be consistent with
+    Sonnet 1 (by setting ``channel_axis=-1``), Sonnet 2 (by setting
+    ``channel_axis`` to the axis referred to by the ``data_format`` arugument in
+    Sonnet 2) or with Keras (by setting ``channel_axis=axis``).
 
     Args:
       axis: Integer, list of integers, or slice indicating which axes to
@@ -67,6 +101,8 @@ class LayerNorm(hk.Module):
       use_fast_variance: If true, use a faster but less numerically stable
         formulation for computing variance.
       name: The module name.
+      channel_axis: Integer specifying which axis (or set of axes) of the input
+        is the channel/feature dimension.
     """
     super().__init__(name=name)
     if not create_scale and scale_init is not None:
@@ -74,22 +110,18 @@ class LayerNorm(hk.Module):
     if not create_offset and offset_init is not None:
       raise ValueError("Cannot set `offset_init` if `create_offset=False`.")
 
-    if isinstance(axis, slice):
-      self.axis = axis
-    elif isinstance(axis, int):
-      self.axis = (axis,)
-    elif (isinstance(axis, collections.abc.Iterable) and
-          all(isinstance(ax, int) for ax in axis)):
-      self.axis = tuple(axis)
-    else:
-      raise ValueError("`axis` should be an int, slice or iterable of ints.")
+    axis = to_axes_or_slice(axis)
+    if channel_axis is not None:
+      channel_axis = to_axes_or_slice(channel_axis)
 
+    self.axis = axis
     self.eps = eps
     self.create_scale = create_scale
     self.create_offset = create_offset
     self.scale_init = scale_init or jnp.ones
     self.offset_init = offset_init or jnp.zeros
     self.use_fast_variance = use_fast_variance
+    self.channel_axis = channel_axis
 
   def __call__(
       self,
@@ -120,10 +152,7 @@ class LayerNorm(hk.Module):
       raise ValueError(
           "Cannot pass `offset` at call time if `create_offset=True`.")
 
-    axis = self.axis
-    if isinstance(axis, slice):
-      axis = tuple(range(inputs.ndim)[axis])
-
+    axis = to_abs_axes(self.axis, inputs.ndim)
     mean = jnp.mean(inputs, axis=axis, keepdims=True)
     if self.use_fast_variance:
       mean_of_squares = jnp.mean(jnp.square(inputs), axis=axis, keepdims=True)
@@ -131,7 +160,26 @@ class LayerNorm(hk.Module):
     else:
       variance = jnp.var(inputs, axis=axis, keepdims=True)
 
-    param_shape = inputs.shape[-1:]
+    if (self.create_scale or self.create_offset) and self.channel_axis is None:
+      if ERROR_FOR_ERROR_PRONE_CHANNELS and axis != (inputs.ndim - 1,):
+        raise ValueError("When axis is not the final dimension we require "
+                         "you to also pass `channel_axis` in the ctor."
+                         f" axis={axis} ndim={inputs.ndim}")
+
+    channel_axis = to_abs_axes(
+        ((-1,) if self.channel_axis is None else self.channel_axis),
+        inputs.ndim)
+
+    # Shape for the learnable scale and offset is the number of channels.
+    # See: https://arxiv.org/pdf/1803.08494.pdf around equation 6.
+    if channel_axis == (inputs.ndim - 1,):
+      # For channel_axis=-1 we store non-broadcast param shape for compatibility
+      # with older checkpoints.
+      param_shape = (inputs.shape[-1],)
+    else:
+      param_shape = tuple((inputs.shape[i] if i in channel_axis else 1)
+                          for i in range(inputs.ndim))
+
     if self.create_scale:
       scale = hk.get_parameter("scale", param_shape, inputs.dtype,
                                init=self.scale_init)
@@ -189,9 +237,11 @@ class InstanceNorm(LayerNorm):
         default it is ``channels_last``.
       name: Name of the module.
     """
-    if utils.get_channel_index(data_format) == 1:
+    channel_axis = utils.get_channel_index(data_format)
+    if channel_axis == 1:
       axis = slice(2, None)
     else:  # channel_index = -1
+      assert channel_axis == -1
       axis = slice(1, -1)
     super().__init__(
         axis=axis,
@@ -200,4 +250,5 @@ class InstanceNorm(LayerNorm):
         eps=eps,
         scale_init=scale_init,
         offset_init=offset_init,
+        channel_axis=channel_axis,
         name=name)
